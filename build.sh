@@ -44,13 +44,20 @@ git checkout --quiet --detach "$tag"
 git config user.name "t3code-fork build"
 git config user.email "build@t3code-fork.invalid"
 
-node_wanted=v$(jq -r .engines.node package.json)
-if [ "$(node --version)" != "$node_wanted" ]; then
-  echo "$tag builds with Node $node_wanted; this is $(node --version)." >&2
-  exit 1
-fi
-pnpm install --frozen-lockfile --filter 't3...' --filter '@t3tools/scripts...'
-export PATH="$PWD/node_modules/.bin:$PATH"
+# The release's own tools, only once there is a fix to try: a release that needs none is not built.
+tools_ready=
+need_tools() {
+  [ -z "$tools_ready" ] || return 0
+  local node_wanted
+  node_wanted=v$(jq -r .engines.node package.json)
+  if [ "$(node --version)" != "$node_wanted" ]; then
+    echo "$tag builds with Node $node_wanted; this is $(node --version)." >&2
+    exit 1
+  fi
+  pnpm install --frozen-lockfile --filter 't3...' --filter '@t3tools/scripts...'
+  export PATH="$PWD/node_modules/.bin:$PATH"
+  tools_ready=yes
+}
 
 # A fix stands when it applies and the packages it touches still typecheck and pass their tests.
 stands() {
@@ -76,6 +83,7 @@ for dir in "$here"/patches/*/; do
     echo "- [#$pr](https://github.com/$upstream/pull/$pr) $title: part of upstream's $tag, no longer carried" >> "$work/fixes.md"
     continue
   fi
+  need_tools
   fitted=
   for patch in "$dir"*.patch; do
     rm -f "$work/check.log"
