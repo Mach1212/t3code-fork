@@ -1,0 +1,125 @@
+name: Follow upstream's stable releases
+
+# When upstream has a stable release that this fork has not built with its current fixes,
+# build it (build.sh) and publish it as a release here.
+on:
+  schedule:
+    - cron: "17 */3 * * *"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Upstream release to build, such as v0.1.9. Empty: its latest stable release."
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+concurrency:
+  group: follow-upstream
+  cancel-in-progress: false
+
+env:
+  GH_TOKEN: ${{ github.token }}
+  UPSTREAM: pingdotgg/t3code
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Which release, and whether it is built already
+        id: plan
+        env:
+          TAG_INPUT: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          latest=$(gh api "repos/$UPSTREAM/releases/latest" --jq .tag_name)
+          tag=${TAG_INPUT:-$latest}
+          # A build is made of the release, the fixes and the recipe.
+          key=$(git rev-parse HEAD:patches HEAD:build.sh | sha256sum | cut -c1-16)
+          builds=$(gh api "repos/$GITHUB_REPOSITORY/releases" --paginate |
+            jq -r --arg prefix "$tag-t3kube." --arg key "build-key: $key" \
+              '.[] | select(.tag_name | startswith($prefix)) | "\(.tag_name) \((.body // "") | contains($key))"')
+          if grep -q ' true$' <<< "$builds"; then
+            echo "$tag is built already with these fixes."
+            echo "build=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          last=$(sed -n "s/^$tag-t3kube\.\([0-9]*\) .*/\1/p" <<< "$builds" | sort -n | tail -n 1)
+          package=$(curl -fsSL "https://raw.githubusercontent.com/$UPSTREAM/$tag/package.json")
+          {
+            echo "build=true"
+            echo "tag=$tag"
+            echo "name=$tag-t3kube.$((${last:-0} + 1))"
+            echo "key=$key"
+            echo "latest=$([ "$tag" = "$latest" ] && echo true || echo false)"
+            echo "node=$(jq -r .engines.node <<< "$package")"
+            echo "pnpm=$(jq -r '.packageManager | sub("^pnpm@"; "") | sub("\\+.*$"; "")' <<< "$package")"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Node and pnpm as the release names them, and patchelf
+        if: steps.plan.outputs.build == 'true'
+        env:
+          NODE: ${{ steps.plan.outputs.node }}
+          PNPM: ${{ steps.plan.outputs.pnpm }}
+        run: |
+          set -euo pipefail
+          curl -fsSL -o "$RUNNER_TEMP/node.tar.xz" "https://nodejs.org/dist/v$NODE/node-v$NODE-linux-x64.tar.xz"
+          curl -fsSL "https://nodejs.org/dist/v$NODE/SHASUMS256.txt" |
+            grep " node-v$NODE-linux-x64.tar.xz\$" | sed "s# .*#  $RUNNER_TEMP/node.tar.xz#" | sha256sum -c -
+          mkdir "$RUNNER_TEMP/node"
+          tar -xJf "$RUNNER_TEMP/node.tar.xz" -C "$RUNNER_TEMP/node" --strip-components=1
+          PATH="$RUNNER_TEMP/node/bin:$PATH" npm install --global --silent "pnpm@$PNPM"
+          echo "$RUNNER_TEMP/node/bin" >> "$GITHUB_PATH"
+          command -v patchelf > /dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq patchelf; }
+
+      - name: Build
+        id: build
+        if: steps.plan.outputs.build == 'true'
+        env:
+          TAG: ${{ steps.plan.outputs.tag }}
+        run: |
+          set +e
+          ./build.sh "$TAG" out
+          code=$?
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          exit "$code"
+
+      # A fix that does not fit fails this run once. The draft keeps later runs from failing
+      # again until patches/ or build.sh changes.
+      - name: Remember a fix that does not fit this release
+        if: failure() && steps.build.outputs.code == '3'
+        env:
+          NAME: ${{ steps.plan.outputs.name }}
+          TAG: ${{ steps.plan.outputs.tag }}
+          KEY: ${{ steps.plan.outputs.key }}
+        run: |
+          gh release create "$NAME" --draft --target "$GITHUB_SHA" \
+            --title "T3 Code ${TAG#v}: a fix does not fit" \
+            --notes "No build: a fix in patches/ does not fit $TAG. The run that says which: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID
+
+          build-key: $KEY"
+
+      - name: Publish
+        if: steps.plan.outputs.build == 'true'
+        env:
+          NAME: ${{ steps.plan.outputs.name }}
+          TAG: ${{ steps.plan.outputs.tag }}
+          KEY: ${{ steps.plan.outputs.key }}
+          LATEST: ${{ steps.plan.outputs.latest }}
+        run: |
+          set -euo pipefail
+          printf '\nbuild-key: %s\n' "$KEY" >> out/notes.md
+          gh release create "$NAME" out/*.tar.gz out/SHA256SUMS --target "$GITHUB_SHA" \
+            --title "T3 Code ${TAG#v}, build ${NAME##*.}" --notes-file out/notes.md --latest="$LATEST"
+          # The list of builds; its commits also keep GitHub from switching the schedule off.
+          echo "- $(date -u +%F) [$NAME]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/tag/$NAME)" >> builds.md
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add builds.md
+          git commit --quiet -m "build $NAME"
+          git pull --quiet --rebase
+          git push --quiet
