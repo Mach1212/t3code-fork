@@ -1,8 +1,12 @@
 # T3 Code, with fixes upstream has not shipped yet
 
 This is a fork of [pingdotgg/t3code](https://github.com/pingdotgg/t3code). It exists to run
-stable T3 Code releases with a few fixes before upstream ships them. It follows upstream by
-itself: nobody merges anything here by hand.
+stable T3 Code releases with a few fixes before upstream ships them.
+
+**It makes no more builds.** Upstream has merged both fixes it carried, and its workflow is
+switched off. The builds of 0.1.8 and 0.1.9 stay until upstream's next stable release has the
+fixes; after that this repository keeps only the screenshots that upstream's issues and pull
+requests show, and is archived. The rest of this page says how the builds were made.
 
 ## What it publishes
 
