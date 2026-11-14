@@ -1,5 +1,5 @@
 diff --git a/packages/provider-opencode/src/server/adapter.test.ts b/packages/provider-opencode/src/server/adapter.test.ts
-index 7c85c94d385e643300250c5243edd000d22308a4..86e5a12e43b3e054dfa7bccded63a150606987fd 100644
+index 7c85c94d385e643300250c5243edd000d22308a4..5f93f82095a5356dc7c95b82460a10144dddcf6f 100644
 --- a/packages/provider-opencode/src/server/adapter.test.ts
 +++ b/packages/provider-opencode/src/server/adapter.test.ts
 @@ -42,6 +42,7 @@ import type * as ProviderEventLoggers from "@t3tools/provider-core/server/Provid
@@ -26,7 +26,7 @@ index 7c85c94d385e643300250c5243edd000d22308a4..86e5a12e43b3e054dfa7bccded63a150
      });
    return {
      nativeSessionId,
-@@ -364,6 +367,142 @@ describe("OpenCodeAdapterV2", () => {
+@@ -364,6 +367,263 @@ describe("OpenCodeAdapterV2", () => {
      ),
    );
  
@@ -51,6 +51,12 @@ index 7c85c94d385e643300250c5243edd000d22308a4..86e5a12e43b3e054dfa7bccded63a150
 +          },
 +          abort: async () => ({ data: true }),
 +          children: async () => ({ data: [] }),
++          get: async ({ sessionID }: { sessionID: string }) => ({
++            data: { id: sessionID, parentID: root, time: { created: 1, updated: 1 } },
++          }),
++          update: async ({ sessionID }: { sessionID: string }) => ({
++            data: { id: sessionID, time: { created: 1, updated: 2 } },
++          }),
 +        },
 +      }).pipe(
 +        Effect.provideService(ProviderContinuationRequests.ProviderContinuationRequests, {
@@ -107,6 +113,92 @@ index 7c85c94d385e643300250c5243edd000d22308a4..86e5a12e43b3e054dfa7bccded63a150
 +          metadata: {},
 +        },
 +      });
++      // The wake launches a subagent, which works before its run starts.
++      const child = "ses_wake_child";
++      yield* push(
++        text("msg_reply", {
++          id: "prt_task",
++          type: "tool",
++          tool: "task",
++          callID: "call_task",
++          state: {
++            status: "running",
++            input: { description: "Check", prompt: "check", subagent_type: "general" },
++            title: "Check",
++            metadata: { parentSessionId: root, sessionId: child },
++            time: { start: 3 },
++          },
++        }),
++      );
++      const childEvent = (type: string, info: object) => ({
++        type,
++        properties: { sessionID: child, ...info },
++      });
++      yield* push(
++        childEvent("message.updated", {
++          info: { id: "msg_child_prompt", sessionID: child, role: "user", time: { created: 3 } },
++        }),
++      );
++      yield* push(
++        childEvent("message.part.updated", {
++          part: {
++            id: "prt_child_text",
++            sessionID: child,
++            messageID: "msg_child_reply",
++            type: "text",
++            text: "CHILD_WAKE_OK",
++            time: { start: 3, end: 3 },
++          },
++        }),
++      );
++      // It keeps working and launches a subagent of its own, still before the run starts.
++      yield* push(childEvent("session.status", { status: { type: "busy" } }));
++      const grandchild = "ses_wake_grandchild";
++      yield* push(
++        childEvent("message.part.updated", {
++          part: {
++            id: "prt_child_task",
++            sessionID: child,
++            messageID: "msg_child_reply",
++            type: "tool",
++            tool: "task",
++            callID: "call_child_task",
++            state: {
++              status: "running",
++              input: { description: "Dig", prompt: "dig", subagent_type: "general" },
++              title: "Dig",
++              metadata: { parentSessionId: child, sessionId: grandchild },
++              time: { start: 3 },
++            },
++          },
++        }),
++      );
++      yield* push({
++        type: "message.updated",
++        properties: {
++          sessionID: grandchild,
++          info: {
++            id: "msg_grandchild_prompt",
++            sessionID: grandchild,
++            role: "user",
++            time: { created: 3 },
++          },
++        },
++      });
++      yield* push({
++        type: "message.part.updated",
++        properties: {
++          sessionID: grandchild,
++          part: {
++            id: "prt_grandchild_text",
++            sessionID: grandchild,
++            messageID: "msg_grandchild_reply",
++            type: "text",
++            text: "GRANDCHILD_WAKE_OK",
++            time: { start: 3, end: 3 },
++          },
++        },
++      });
 +      const finish = Effect.gen(function* () {
 +        yield* push(text("msg_reply", { text: "WAKE_OK", time: { start: 3, end: 4 } }));
 +        yield* push(message("msg_reply", { ...reply, time: { created: 3, completed: 4 } }));
@@ -117,6 +209,15 @@ index 7c85c94d385e643300250c5243edd000d22308a4..86e5a12e43b3e054dfa7bccded63a150
 +        offers.map((offer) => [offer.threadId, offer.delivery]),
 +        [[harness.threadId, "adapter_buffered"]],
 +      );
++      if (endedFirst) {
++        // A second task finishes before T3 starts the first run; its turn must not be lost in it.
++        yield* push(message("msg_task_2", { role: "user", time: { created: 5 } }));
++        yield* push(status("busy"));
++        const second = { role: "assistant", parentID: "msg_task_2" };
++        yield* push(message("msg_reply_2", { ...second, time: { created: 6, completed: 7 } }));
++        yield* push(text("msg_reply_2", { text: "WAKE_2_OK", time: { start: 6, end: 7 } }));
++        yield* push(status("idle"));
++      }
 +
 +      const wakeRun = yield* runEvents;
 +      yield* harness.startTurn(
@@ -162,6 +263,26 @@ index 7c85c94d385e643300250c5243edd000d22308a4..86e5a12e43b3e054dfa7bccded63a150
 +        [RunId.make("run-opencode-wake-2")],
 +        "an approval OpenCode asks for before the run starts is shown in it",
 +      );
++      assert.isTrue(
++        events.some(
++          (event) =>
++            event.type === "turn_item.updated" &&
++            event.turnItem.threadId !== harness.threadId &&
++            event.turnItem.type === "assistant_message" &&
++            event.turnItem.text === "CHILD_WAKE_OK",
++        ),
++        "a subagent the wake launched before its run started keeps its work",
++      );
++      assert.isTrue(
++        events.some(
++          (event) =>
++            event.type === "turn_item.updated" &&
++            event.turnItem.type === "assistant_message" &&
++            event.turnItem.text === "GRANDCHILD_WAKE_OK",
++        ),
++        "so does a subagent it launched",
++      );
++      assert.equal(offers.length, endedFirst ? 2 : 1, "each turn OpenCode starts gets an offer");
 +      assert.equal(prompts.length, 1, "OpenCode already runs this turn; prompting would repeat it");
 +    }).pipe(Effect.provide(Layer.merge(IdAllocator.layer, McpProviderSessions.layer))),
 +  );
@@ -170,7 +291,7 @@ index 7c85c94d385e643300250c5243edd000d22308a4..86e5a12e43b3e054dfa7bccded63a150
      Effect.gen(function* () {
        const updates: Array<{ sessionID: string; permission: unknown }> = [];
 diff --git a/packages/provider-opencode/src/server/adapter.ts b/packages/provider-opencode/src/server/adapter.ts
-index 0acf0e8a80df899f3ca01d2c18f1131558023282..13cdbdd547e596754142ce6ec7b8811069ecd349 100644
+index 0acf0e8a80df899f3ca01d2c18f1131558023282..a3f895d387f30befe018b963e6e254c8693fb75c 100644
 --- a/packages/provider-opencode/src/server/adapter.ts
 +++ b/packages/provider-opencode/src/server/adapter.ts
 @@ -57,6 +57,7 @@ import * as Stream from "effect/Stream";
@@ -203,7 +324,7 @@ index 0acf0e8a80df899f3ca01d2c18f1131558023282..13cdbdd547e596754142ce6ec7b88110
    readonly providerTurns: Map<string, OrchestrationV2ProviderTurn>;
    readonly runtimeRequests: Map<string, OrchestrationV2RuntimeRequest>;
    readonly messageRoles: Map<string, "user" | "assistant">;
-@@ -879,6 +890,25 @@ function isMessageAbortedError(event: Extract<OpenCodeEvent, { type: "session.er
+@@ -879,6 +890,37 @@ function isMessageAbortedError(event: Extract<OpenCodeEvent, { type: "session.er
    return event.properties.error?.name === "MessageAbortedError";
  }
  
@@ -226,10 +347,22 @@ index 0acf0e8a80df899f3ca01d2c18f1131558023282..13cdbdd547e596754142ce6ec7b88110
 +  }
 +}
 +
++function isBusyStatus(event: OpenCodeEvent): boolean {
++  return event.type === "session.status" && event.properties.status.type !== "idle";
++}
++
++function isUserMessage(event: OpenCodeEvent | undefined, sessionId: string): boolean {
++  return (
++    event?.type === "message.updated" &&
++    event.properties.info.role === "user" &&
++    event.properties.sessionID === sessionId
++  );
++}
++
  function isOpenCodeNotFound(cause: unknown): boolean {
    const seen = new Set<unknown>();
    const queue: Array<unknown> = [cause];
-@@ -936,6 +966,7 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
+@@ -936,6 +978,7 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
    const idAllocator = yield* IdAllocator.IdAllocatorV2;
    const host = yield* ProviderHost.ProviderHost;
    const mcpSessions = yield* McpProviderSessions.McpProviderSessions;
@@ -237,7 +370,16 @@ index 0acf0e8a80df899f3ca01d2c18f1131558023282..13cdbdd547e596754142ce6ec7b88110
    const messageIdClock = yield* Ref.make({ epochMillis: -1, counter: 0 });
  
    return ProviderAdapter.ProviderAdapterV2.of({
-@@ -1427,6 +1458,7 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
+@@ -1011,6 +1054,8 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
+         const subagentsByNativeItemId = new Map<string, OpenCodeSubagentContext>();
+         const subagentsByChildSessionId = new Map<string, OpenCodeSubagentContext>();
+         const relatedSessionOwners = new Map<string, OpenCodeThreadState>();
++        // Subagent sessions a wake launched before its run began, by the root that holds them.
++        const wakeChildOwners = new Map<string, OpenCodeThreadState>();
+         // Busy children outlive parent settlement; keep their server open.
+         const busySessionIds = new Set<string>();
+         // A background task returns before its new child session reports busy.
+@@ -1427,6 +1472,7 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
                providerThread: childProviderThread,
                appThread: childThread,
                activeTurn: null,
@@ -245,7 +387,7 @@ index 0acf0e8a80df899f3ca01d2c18f1131558023282..13cdbdd547e596754142ce6ec7b88110
                providerTurns: new Map(),
                runtimeRequests: new Map(),
                messageRoles: new Map(),
-@@ -2074,7 +2106,6 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
+@@ -2074,7 +2120,6 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
              | { readonly type: "permission"; readonly value: PermissionRequest }
              | { readonly type: "question"; readonly value: QuestionRequest },
          ) {
@@ -253,7 +395,7 @@ index 0acf0e8a80df899f3ca01d2c18f1131558023282..13cdbdd547e596754142ce6ec7b88110
            const attempt = Effect.gen(function* () {
              if (
                settledNativeRequestIds.has(nativeRequestId) ||
-@@ -2088,7 +2119,8 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
+@@ -2088,7 +2133,8 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
              yield* emitRuntimeRequest(owner, nativeRequestId, request);
              return true;
            });
@@ -263,7 +405,7 @@ index 0acf0e8a80df899f3ca01d2c18f1131558023282..13cdbdd547e596754142ce6ec7b88110
            pendingChildRequestRoutes.add(nativeRequestId);
            yield* Effect.gen(function* () {
              for (let retry = 0; retry < 5; retry += 1) {
-@@ -2602,13 +2634,7 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
+@@ -2602,13 +2648,7 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
            }
          });
  
@@ -278,52 +420,16 @@ index 0acf0e8a80df899f3ca01d2c18f1131558023282..13cdbdd547e596754142ce6ec7b88110
            switch (event.type) {
              case "server.connected":
                if (hasConnected) {
-@@ -2785,6 +2811,83 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
+@@ -2785,6 +2825,117 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
            }
          });
  
-+        // A prompt OpenCode takes while no T3 turn runs starts a turn of its own. Its events are
-+        // kept for the run T3 starts for it; the offer waits for busy, which a prompt that asks
-+        // for no reply never reaches.
-+        const holdForWake = Effect.fnUntraced(function* (event: OpenCodeEvent) {
-+          const sessionId = turnEventSessionId(event);
-+          // A request blocks OpenCode until answered, and routing gives up after a few seconds,
-+          // so one from a subagent waits on its root's wake like the root's own.
-+          const isRequest = event.type === "permission.asked" || event.type === "question.asked";
-+          let state =
-+            sessionId === undefined
-+              ? undefined
-+              : (threads.get(sessionId) ??
-+                (isRequest ? relatedSessionOwners.get(sessionId) : undefined));
-+          while (isRequest && state !== undefined && state.parentSubagent !== null) {
-+            state = state.parentSubagent.parentState;
-+          }
-+          if (state === undefined || state.parentSubagent !== null) return false;
-+          if (state.wake?.replaying === true) {
-+            state.wake.events.push(event);
-+            return true;
-+          }
-+          if (state.activeTurn !== null) return false;
-+          if (
-+            event.type === "message.updated" &&
-+            event.properties.info.role === "user" &&
-+            !state.userMessageIds.includes(event.properties.info.id) &&
-+            state.wake?.started !== true
-+          ) {
-+            state.wake = { events: [], started: false, replaying: false };
-+          }
-+          const wake = state.wake;
-+          if (wake === null) return false;
-+          wake.events.push(event);
++        const offerWake = Effect.fnUntraced(function* (
++          state: OpenCodeThreadState,
++          wake: OpenCodeWake,
++        ) {
 +          const threadId = state.providerThread.appThreadId;
-+          if (
-+            wake.started ||
-+            threadId === null ||
-+            event.type !== "session.status" ||
-+            event.properties.status.type === "idle"
-+          ) {
-+            return false;
-+          }
++          if (threadId === null) return;
 +          wake.started = true;
 +          const release = Effect.sync(() => {
 +            if (state.wake === wake && !wake.replaying) state.wake = null;
@@ -345,6 +451,76 @@ index 0acf0e8a80df899f3ca01d2c18f1131558023282..13cdbdd547e596754142ce6ec7b88110
 +              ),
 +            clearIfCurrent: () => release,
 +          });
++        });
++
++        // A prompt OpenCode takes while no T3 turn runs starts a turn of its own. Its events are
++        // kept for the run T3 starts for it; the offer waits for busy, which a prompt that asks
++        // for no reply never reaches.
++        // Held events reach dispatch only on replay, so what must be known sooner is noted here.
++        const noteHeldEvent = (
++          root: OpenCodeThreadState,
++          sessionId: string,
++          event: OpenCodeEvent,
++        ) => {
++          if (event.type === "message.part.updated" && event.properties.part.type === "tool") {
++            const childSessionId =
++              event.properties.part.tool.toLowerCase() === "task"
++                ? taskSessionId(event.properties.part)
++                : null;
++            if (childSessionId !== null && !threads.has(childSessionId)) {
++              wakeChildOwners.set(childSessionId, root);
++            }
++          }
++          // The session stays open for a held subagent that is still working.
++          if (threads.has(sessionId)) return;
++          if (isBusyStatus(event)) busySessionIds.add(sessionId);
++          else if (event.type === "session.status" || event.type === "session.idle") {
++            busySessionIds.delete(sessionId);
++          }
++        };
++
++        const holdForWake = Effect.fnUntraced(function* (event: OpenCodeEvent) {
++          const sessionId = turnEventSessionId(event);
++          if (sessionId === undefined) return false;
++          // A request blocks OpenCode until answered, and routing gives up after a few seconds,
++          // so one from a subagent waits on its root's wake like the root's own.
++          const isRequest = event.type === "permission.asked" || event.type === "question.asked";
++          let state =
++            threads.get(sessionId) ?? (isRequest ? relatedSessionOwners.get(sessionId) : undefined);
++          if (state === undefined) {
++            // A subagent the wake launched has no thread until the replay creates it.
++            const root = wakeChildOwners.get(sessionId);
++            if (root === undefined) return false;
++            if (root.wake === null) {
++              wakeChildOwners.delete(sessionId);
++              return false;
++            }
++            root.wake.events.push(event);
++            noteHeldEvent(root, sessionId, event);
++            return true;
++          }
++          const isRoot = state.parentSubagent === null;
++          while (state.parentSubagent !== null) state = state.parentSubagent.parentState;
++          if (state.wake?.replaying === true) {
++            state.wake.events.push(event);
++            noteHeldEvent(state, sessionId, event);
++            return true;
++          }
++          if (!isRoot && !isRequest) return false;
++          if (state.activeTurn !== null) return false;
++          if (
++            event.type === "message.updated" &&
++            event.properties.info.role === "user" &&
++            !state.userMessageIds.includes(event.properties.info.id) &&
++            state.wake?.started !== true
++          ) {
++            state.wake = { events: [], started: false, replaying: false };
++          }
++          const wake = state.wake;
++          if (wake === null) return false;
++          wake.events.push(event);
++          noteHeldEvent(state, sessionId, event);
++          if (!wake.started && isBusyStatus(event)) yield* offerWake(state, wake);
 +          return false;
 +        });
 +
@@ -362,7 +538,7 @@ index 0acf0e8a80df899f3ca01d2c18f1131558023282..13cdbdd547e596754142ce6ec7b88110
          const inputProviderSessionId = input.providerSessionId;
  
          const subscription = yield* sdkCall("event.subscribe", {}, () =>
-@@ -2909,6 +3012,7 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
+@@ -2909,6 +3060,7 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
              providerThread,
              appThread,
              activeTurn: null,
@@ -370,7 +546,7 @@ index 0acf0e8a80df899f3ca01d2c18f1131558023282..13cdbdd547e596754142ce6ec7b88110
              providerTurns: new Map(),
              runtimeRequests: new Map(),
              messageRoles: new Map(),
-@@ -3274,10 +3378,16 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
+@@ -3274,10 +3426,16 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
                  );
                }
                yield* applyPermissionRules(state, turnInput.runtimePolicy);
@@ -388,7 +564,7 @@ index 0acf0e8a80df899f3ca01d2c18f1131558023282..13cdbdd547e596754142ce6ec7b88110
                const startedAt = yield* DateTime.now;
                const syntheticNativeTurnId = `${sessionId}:attempt:${turnInput.attemptId}`;
                const providerTurnId = idAllocator.derive.providerTurn({
-@@ -3329,24 +3439,27 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
+@@ -3329,34 +3487,79 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
                  providerTurn,
                  nextItemOrdinal: turnInput.providerTurnOrdinal * 100 + 1,
                  nativeUserMessageId: null,
@@ -418,32 +594,52 @@ index 0acf0e8a80df899f3ca01d2c18f1131558023282..13cdbdd547e596754142ce6ec7b88110
 +              const wake = continuation ? state.wake : null;
 +              // Another turn takes what OpenCode does from here on, so its own run has nothing left.
 +              if (!continuation) state.wake = null;
++              // From here, events that arrive queue behind the kept ones, to keep their order.
++              if (wake !== null) wake.replaying = true;
++              const releaseWake = Effect.sync(() => {
++                if (wake !== null && state.wake === wake) state.wake = null;
++              });
                state.appThread = turnInput.appThread;
                state.activeTurn = turn;
                state.providerTurns.set(String(providerTurnId), providerTurn);
-@@ -3357,6 +3470,38 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
-                 lastRunOrdinal: turnInput.runOrdinal,
-               });
-               yield* updateProviderSession("running", null);
+-              yield* emitProviderTurn(state, turn, "running", null);
+-              yield* updateProviderThread(state, {
+-                status: "active",
+-                firstRunOrdinal: state.providerThread.firstRunOrdinal ?? turnInput.runOrdinal,
+-                lastRunOrdinal: turnInput.runOrdinal,
+-              });
+-              yield* updateProviderSession("running", null);
++              yield* Effect.gen(function* () {
++                yield* emitProviderTurn(state, turn, "running", null);
++                yield* updateProviderThread(state, {
++                  status: "active",
++                  firstRunOrdinal: state.providerThread.firstRunOrdinal ?? turnInput.runOrdinal,
++                  lastRunOrdinal: turnInput.runOrdinal,
++                });
++                yield* updateProviderSession("running", null);
++              }).pipe(Effect.onError(() => releaseWake));
 +              if (continuation) {
 +                if (wake !== null) {
-+                  // Events that arrive while these replay queue behind them, to keep their order.
-+                  wake.replaying = true;
 +                  yield* Effect.gen(function* () {
 +                    while (true) {
 +                      const event = wake.events.shift();
-+                      if (event === undefined) {
-+                        state.wake = null;
++                      if (event === undefined) return;
++                      yield* dispatchEvent(event);
++                      if (state.activeTurn !== turn && isUserMessage(wake.events[0], sessionId)) {
++                        // OpenCode began another turn of its own before this run did; it gets a run
++                        // of its own.
++                        const next: OpenCodeWake = {
++                          events: wake.events.splice(0),
++                          started: false,
++                          replaying: false,
++                        };
++                        state.wake = next;
++                        if (next.events.some(isBusyStatus)) yield* offerWake(state, next);
 +                        return;
 +                      }
-+                      yield* dispatchEvent(event);
 +                    }
 +                  }).pipe(
-+                    Effect.ensuring(
-+                      Effect.sync(() => {
-+                        if (state.wake === wake) state.wake = null;
-+                      }),
-+                    ),
++                    Effect.ensuring(releaseWake),
 +                    Effect.tapError((cause) =>
 +                      finalizeTurn(state, turn, "failed", {
 +                        failure: makeProviderFailure({ cause, class: "provider_error" }),
