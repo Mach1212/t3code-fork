@@ -68,21 +68,47 @@ stands() {
   done
 }
 
+# Whether the release has a pull request of upstream: merged, and its merge commit is in the tag.
+released() {
+  local pull
+  pull=$(api "repos/$upstream/pulls/$1")
+  [ "$(jq -r .merged <<< "$pull")" = true ] &&
+    [ "$(api "repos/$upstream/compare/$(jq -r .merge_commit_sha <<< "$pull")...$tag" | jq -r .behind_by)" = 0 ]
+}
+
 : > "$work/fixes.md"
 carried=0
 for dir in "$here"/patches/*/; do
   [ -d "$dir" ] || continue
-  pr=$(basename "$dir")
-  pull=$(api "repos/$upstream/pulls/$pr")
-  title=$(jq -r .title <<< "$pull")
-  say "$upstream#$pr: $title"
-  # A fix upstream merged before this release is in the release already.
-  if [ "$(jq -r .merged <<< "$pull")" = true ] &&
-    [ "$(api "repos/$upstream/compare/$(jq -r .merge_commit_sha <<< "$pull")...$tag" | jq -r .behind_by)" = 0 ]; then
-    echo "in upstream's $tag: not carried"
-    echo "- [#$pr](https://github.com/$upstream/pull/$pr) $title: part of upstream's $tag, no longer carried" >> "$work/fixes.md"
-    continue
-  fi
+  name=$(basename "$dir")
+  case $name in
+    *[!0-9]*)
+      # Not a pull request of upstream: this fork's own, carried for as long as its folder is here.
+      title=$(head -n 1 "$dir/title" 2> /dev/null || true)
+      what="patches/$name"
+      entry="- ${title:-$name} (this fork's own, \`patches/$name\`)"
+      say "$what: ${title:-$name}"
+      ;;
+    *)
+      title=$(api "repos/$upstream/pulls/$name" | jq -r .title)
+      what="$upstream#$name"
+      entry="- [#$name](https://github.com/$upstream/pull/$name) $title"
+      say "$what: $title"
+      # A fix upstream merged before this release is in the release already.
+      if released "$name"; then
+        echo "in upstream's $tag: not carried"
+        echo "$entry: part of upstream's $tag, no longer carried" >> "$work/fixes.md"
+        continue
+      fi
+      # So is one that upstream fixed with another pull request, named in the file superseded-by.
+      other=$(tr -dc 0-9 < "$dir/superseded-by" 2> /dev/null || true)
+      if [ -n "$other" ] && released "$other"; then
+        echo "upstream's $tag has #$other for it: not carried"
+        echo "$entry: upstream's $tag has [#$other](https://github.com/$upstream/pull/$other) for it, no longer carried" >> "$work/fixes.md"
+        continue
+      fi
+      ;;
+  esac
   need_tools
   fitted=
   for patch in "$dir"*.patch; do
@@ -98,12 +124,12 @@ for dir in "$here"/patches/*/; do
     git clean --quiet -fd -- apps packages
   done
   if [ -z "$fitted" ]; then
-    echo "No version of the fix for $upstream#$pr fits $tag. Add one to patches/$pr/." >&2
+    echo "No version of $what fits $tag. Add one to patches/$name/." >&2
     exit 3
   fi
-  git commit --quiet --no-verify -m "carry $upstream#$pr ($fitted)"
+  git commit --quiet --no-verify -m "carry patches/$name ($fitted)"
   echo "carried as $fitted"
-  echo "- [#$pr](https://github.com/$upstream/pull/$pr) $title" >> "$work/fixes.md"
+  echo "$entry" >> "$work/fixes.md"
   carried=$((carried + 1))
 done
 
