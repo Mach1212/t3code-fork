@@ -437,6 +437,21 @@ interface PiWake {
   readonly events: Array<PiRpcRecord>;
 }
 
+type PiSubagentEvent = Extract<
+  ProviderAdapter.ProviderAdapterV2Event,
+  { readonly type: "subagent.updated" }
+>;
+
+// A child that the `task` tool of OmO Native (a Pi fork) hosts. One started in the background
+// outlives its tool call and its turn, so what was last shown of it is kept until it ends.
+interface PiHostedTask {
+  subagent: PiSubagentEvent["subagent"];
+  turnItem: Extract<OrchestrationV2TurnItem, { readonly type: "subagent" }>;
+  // The session listed it among its children, and later no longer did.
+  listed: boolean;
+  ended: boolean;
+}
+
 export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
   options: PiAdapterV2Options,
 ) {
@@ -616,6 +631,7 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
       // Turn failures can leave Pi alive; pump termination retires the runtime.
       let runtimeRetired = false;
       let pendingWake: PiWake | null = null;
+      const hostedTasks = new Map<string, PiHostedTask>();
       let extensionStatusReset: {
         previous: NonNullable<OrchestrationV2ProviderSession["extensionStatuses"]>;
         readonly touched: Set<string>;
@@ -1424,6 +1440,166 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
         });
         if (toolName === "subagent") {
           yield* emitSubagentTasks(turn, toolCallId, resultRecord, completed);
+        } else if (toolName === "task") {
+          yield* emitHostedTask(turn, toolCallId, args, resultRecord, completed, isError);
+        }
+      });
+
+      const emitHostedTaskUpdate = Effect.fnUntraced(function* (task: PiHostedTask) {
+        yield* emit({ type: "subagent.updated", driver: PI_PROVIDER, subagent: task.subagent });
+        yield* emit({ type: "turn_item.updated", driver: PI_PROVIDER, turnItem: task.turnItem });
+      });
+
+      const emitHostedTask = Effect.fnUntraced(function* (
+        turn: ActivePiTurn,
+        toolCallId: string,
+        args: unknown,
+        resultRecord: unknown,
+        completed: boolean,
+        isError: boolean,
+      ) {
+        const prompt = recordString(args, "prompt");
+        const agent = recordString(args, "subagent_type") ?? recordString(args, "category");
+        // Another extension may name a tool `task`; only this shape is a hosted child.
+        if (prompt === undefined || agent === undefined) return;
+        const details = recordField(resultRecord, "details");
+        const taskId = recordString(details, "task_id");
+        const reported = piHostedTaskStatus(recordString(details, "status"));
+        const background =
+          recordField(details, "run_in_background") === true ||
+          recordField(args, "run_in_background") === true;
+        const status: PiHostedTaskStatus = !completed
+          ? "running"
+          : isError
+            ? turn.interrupted
+              ? "interrupted"
+              : "failed"
+            : reported === "running" && !background
+              ? "completed"
+              : (reported ?? "completed");
+        const finished = status !== "running";
+        const nativeTaskId = `${toolCallId}:task`;
+        const emittedAt = yield* DateTime.now;
+        const startedAt = turn.toolStartedAt.get(nativeTaskId) ?? emittedAt;
+        turn.toolStartedAt.set(nativeTaskId, startedAt);
+        const subagentId = idAllocator.derive.nodeFromProviderItem({
+          driver: PI_PROVIDER,
+          nativeItemId: nativeTaskId,
+        });
+        const title =
+          recordString(args, "description") ?? recordString(details, "task_summary") ?? agent;
+        const model = recordField(details, "resolved_model");
+        const modelProvider = recordString(model, "provider");
+        const modelId = recordString(model, "model_id");
+        const outputText = contentText(recordField(resultRecord, "content"));
+        const activity =
+          recordString(details, "lastAssistantLine") ??
+          recordString(recordField(details, "progress"), "activity");
+        const progress =
+          !finished && activity !== undefined && activity.length > 0
+            ? { progress: activity.slice(0, 200) }
+            : {};
+        const resultText = finished && outputText.length > 0 ? outputText.slice(0, 10_000) : null;
+        const task: PiHostedTask = {
+          subagent: {
+            id: subagentId,
+            threadId: turn.turnInput.threadId,
+            runId: turn.turnInput.runId,
+            parentNodeId: idAllocator.derive.nodeFromProviderItem({
+              driver: PI_PROVIDER,
+              nativeItemId: toolCallId,
+            }),
+            origin: "provider_native",
+            createdBy: "agent",
+            driver: PI_PROVIDER,
+            providerInstanceId: options.instanceId,
+            providerThreadId: turn.turnInput.providerThread.id,
+            childThreadId: null,
+            nativeTaskRef: providerRef(taskId ?? nativeTaskId),
+            prompt,
+            title,
+            model:
+              modelProvider === undefined || modelId === undefined
+                ? null
+                : `${modelProvider}/${modelId}`,
+            status,
+            ...progress,
+            result: resultText,
+            startedAt,
+            completedAt: finished ? emittedAt : null,
+            updatedAt: emittedAt,
+          },
+          turnItem: {
+            ...baseItemFields(turn, nativeTaskId, startedAt, emittedAt),
+            status,
+            title,
+            completedAt: finished ? emittedAt : null,
+            type: "subagent",
+            subagentId,
+            origin: "provider_native",
+            driver: PI_PROVIDER,
+            providerInstanceId: options.instanceId,
+            childThreadId: null,
+            prompt,
+            ...progress,
+            result: resultText,
+          },
+          listed: false,
+          ended: false,
+        };
+        yield* emitHostedTaskUpdate(task);
+        // Started in the background it is still working when its tool call returns.
+        if (completed && !finished && taskId !== undefined) hostedTasks.set(taskId, task);
+      });
+
+      const settleHostedTask = Effect.fnUntraced(function* (
+        taskId: string,
+        status: Exclude<PiHostedTaskStatus, "running">,
+        result: string,
+      ) {
+        const task = hostedTasks.get(taskId);
+        if (task === undefined) return;
+        hostedTasks.delete(taskId);
+        const completedAt = yield* DateTime.now;
+        const settled = {
+          status,
+          result: result.length > 0 ? result.slice(0, 10_000) : null,
+          completedAt,
+          updatedAt: completedAt,
+        } as const;
+        const { progress: _subagentProgress, ...subagent } = task.subagent;
+        const { progress: _itemProgress, ...turnItem } = task.turnItem;
+        yield* emitHostedTaskUpdate({
+          ...task,
+          subagent: { ...subagent, ...settled },
+          turnItem: { ...turnItem, ...settled },
+        });
+      });
+
+      // What a session says of its hosted tasks arrives outside tool calls, and outside turns.
+      const noteHostedTasks = Effect.fnUntraced(function* (event: PiRpcRecord) {
+        if (hostedTasks.size === 0) return;
+        if (event["type"] === "session_lifecycle") {
+          const listed = piListedHostedTasks(event);
+          if (listed === null) return;
+          for (const [taskId, task] of hostedTasks) {
+            if (listed.has(taskId)) task.listed = true;
+            else if (task.listed) task.ended = true;
+          }
+          return;
+        }
+        if (event["type"] !== "message_end") return;
+        for (const completion of piHostedTaskCompletions(event["message"])) {
+          const status = piHostedTaskStatus(completion.status);
+          if (status === undefined || status === "running") continue;
+          yield* settleHostedTask(completion.taskId, status, completion.result);
+        }
+      });
+
+      // A task the session dropped from its children ended; its report did not reach this turn.
+      const settleEndedHostedTasks = Effect.fnUntraced(function* () {
+        for (const [taskId, task] of Array.from(hostedTasks)) {
+          if (task.ended) yield* settleHostedTask(taskId, "completed", "");
         }
       });
 
@@ -1990,6 +2166,7 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
           }
         }
         yield* cancelPendingPrompts(completedAt);
+        yield* settleEndedHostedTasks();
         // Stop clears Pi's queue, so an unread steer was dropped; otherwise Pi read it before settling.
         for (const messageId of turn.unreadSteers.splice(0)) {
           yield* emitSteerStatus(turn, messageId, interrupted ? "cancelled" : "completed");
@@ -2139,6 +2316,7 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
           }
           return;
         }
+        yield* noteHostedTasks(event);
         // A native wake may wait for a turn owner; status belongs to the live session immediately.
         if (event["type"] === "extension_ui_request" && event["method"] === "setStatus") {
           yield* updateExtensionStatus(event);
@@ -2764,6 +2942,10 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
               } else {
                 yield* cancelPendingPrompts(yield* DateTime.now);
               }
+              // The children ran inside the process that is gone.
+              for (const taskId of Array.from(hostedTasks.keys())) {
+                yield* settleHostedTask(taskId, "interrupted", "");
+              }
               if (unsolicitedActivityDetected) {
                 yield* updateProviderSession("error", PI_UNSOLICITED_ACTIVITY_ERROR);
                 yield* Queue.end(events);
@@ -3152,10 +3334,14 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
           return sessionEntity;
         },
         events: Stream.fromQueue(events),
-        hasPendingBackgroundWork: Effect.sync(() => pendingWake !== null),
+        hasPendingBackgroundWork: Effect.sync(() => pendingWake !== null || hostedTasks.size > 0),
         hasPendingBackgroundWorkForThread: (providerThread) =>
           Effect.sync(
-            () => pendingWake !== null && pendingWake.state.providerThread.id === providerThread.id,
+            () =>
+              (pendingWake !== null && pendingWake.state.providerThread.id === providerThread.id) ||
+              Array.from(hostedTasks.values()).some(
+                (task) => task.subagent.providerThreadId === providerThread.id,
+              ),
           ),
         getModelContextWindow: (selection) => {
           if (selection.instanceId !== options.instanceId) return undefined;
@@ -4049,6 +4235,73 @@ function piAsyncSubagentStatus(
     default:
       return undefined;
   }
+}
+
+const PI_HOSTED_TASK_SOURCE = "senpi-task";
+const PI_HOSTED_TASK_COMPLETION = "senpi-task.completion";
+
+type PiHostedTaskStatus = "running" | "completed" | "failed" | "interrupted";
+
+function piHostedTaskStatus(nativeStatus: string | undefined): PiHostedTaskStatus | undefined {
+  switch (nativeStatus) {
+    case "pending":
+    case "running":
+    case "paused":
+      return "running";
+    case "completed":
+      return "completed";
+    case "error":
+    case "failed":
+    case "lost":
+      return "failed";
+    case "cancelled":
+    case "interrupted":
+      return "interrupted";
+    default:
+      return undefined;
+  }
+}
+
+/** The ids of the hosted tasks a `session_lifecycle` event lists, or null when it cannot say. */
+function piListedHostedTasks(event: PiRpcRecord): ReadonlySet<string> | null {
+  const waitingOn = recordField(recordField(event, "lifecycle"), "waitingOn");
+  if (!Predicate.isObject(waitingOn)) return null;
+  const listed = new Set<string>();
+  for (const key of ["childSources", "background"]) {
+    const sources = recordField(waitingOn, key);
+    if (!Array.isArray(sources)) continue;
+    for (const source of sources) {
+      if (recordString(source, "source") !== PI_HOSTED_TASK_SOURCE) continue;
+      const items = recordField(source, "items");
+      const ids = Array.isArray(items)
+        ? items.flatMap((item) => recordString(item, "id") ?? [])
+        : [];
+      // A count above the items given means some are left out, so absence proves nothing.
+      if ((recordNumber(source, "activeCount") ?? 0) > ids.length) return null;
+      for (const id of ids) listed.add(id);
+    }
+  }
+  return listed;
+}
+
+/** The hosted tasks a custom message reports as ended, with how and with what reply. */
+function piHostedTaskCompletions(
+  message: unknown,
+): ReadonlyArray<{ readonly taskId: string; readonly status: string; readonly result: string }> {
+  if (recordString(message, "role") !== "custom") return [];
+  const producers = recordField(recordField(message, "details"), "producerDetails");
+  if (!Array.isArray(producers)) return [];
+  return producers.flatMap((producer) => {
+    const entries = recordField(producer, "details");
+    if (recordString(producer, "customType") !== PI_HOSTED_TASK_COMPLETION) return [];
+    if (!Array.isArray(entries)) return [];
+    return entries.flatMap((entry) => {
+      const taskId = recordString(entry, "task_id");
+      const status = recordString(entry, "status");
+      if (taskId === undefined || status === undefined) return [];
+      return [{ taskId, status, result: recordString(entry, "final_response") ?? "" }];
+    });
+  });
 }
 
 function piSubagentOutput(result: unknown): string {

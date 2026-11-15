@@ -3629,6 +3629,197 @@ describe("PiAdapterV2", () => {
     }).pipe(Effect.scoped, Effect.provide(layerTest)),
   );
 
+  // Frames follow a live OmO Native 5.1.70 (senpi 2026.11.13) session; its `task` tool hosts children.
+  it.effect.each([
+    { case: "a background child, ended by its completion message", reported: true },
+    { case: "a background child the session no longer lists", reported: false },
+  ])("shows a child the task tool hosts until it ends ($case)", ({ reported }) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakePi;
+      const { runtime, takeEvent } = yield* openRuntime(fake);
+      const providerThread = yield* runtime.ensureThread({
+        threadId: THREAD_ID,
+        modelSelection: modelSelection("default"),
+        runtimePolicy,
+      });
+      yield* startTurn(runtime, providerThread);
+      yield* fake.takeRequest("prompt");
+      yield* fake.emit({ type: "agent_start" });
+      const args = {
+        category: "quick",
+        run_in_background: true,
+        load_skills: [],
+        description: "Sleep and reply",
+        prompt: "Run sleep 15, then reply CHILD_OK.",
+      };
+      yield* fake.emit({
+        type: "tool_execution_start",
+        toolCallId: "call_task",
+        toolName: "task",
+        args,
+      });
+      const started = yield* takeEvent((event) => event.type === "subagent.updated");
+      assert.isTrue(
+        started.type === "subagent.updated" &&
+          started.subagent.status === "running" &&
+          started.subagent.title === "Sleep and reply" &&
+          started.subagent.prompt === args.prompt &&
+          started.subagent.childThreadId === null,
+      );
+      const lifecycle = (ids: ReadonlyArray<string>) => ({
+        type: "session_lifecycle",
+        lifecycle: {
+          state: "running",
+          waitingOn: {
+            children: ids.length,
+            background: [],
+            human: [],
+            childSources: [
+              { source: "senpi-task", activeCount: ids.length, items: ids.map((id) => ({ id })) },
+            ],
+          },
+        },
+      });
+      yield* fake.emit(lifecycle(["st_1"]));
+      yield* fake.emit({
+        type: "tool_execution_end",
+        toolCallId: "call_task",
+        toolName: "task",
+        isError: false,
+        result: {
+          content: [{ type: "text", text: "Started task (st_1, running)" }],
+          details: {
+            task_id: "st_1",
+            status: "running",
+            mode: "spawn",
+            run_in_background: true,
+            resolved_model: { provider: "anthropic", model_id: "claude-haiku-5-5" },
+          },
+        },
+      });
+      const returned = yield* takeEvent(
+        (event) => event.type === "turn_item.updated" && event.turnItem.type === "subagent",
+      );
+      assert.isTrue(
+        returned.type === "turn_item.updated" && returned.turnItem.status === "running",
+        "the tool call returned, the child still works",
+      );
+      yield* fake.emit(lifecycle(["st_1"]));
+      yield* fake.emit({ type: "agent_settled" });
+      yield* takeEvent((event) => event.type === "turn.terminal");
+      assert.isTrue(yield* runtime.hasPendingBackgroundWork!, "the session stays for its child");
+      assert.isTrue(yield* runtime.hasPendingBackgroundWorkForThread!(providerThread));
+
+      yield* fake.emit(lifecycle([]));
+      if (reported) {
+        yield* fake.emit({
+          type: "message_end",
+          message: {
+            role: "custom",
+            customType: "omo-senpi:wake",
+            content: "task completion name:st_1 status:error",
+            details: {
+              producerDetails: [
+                {
+                  customType: "senpi-task.completion",
+                  details: [{ task_id: "st_1", status: "error", final_response: "no shell tool" }],
+                },
+              ],
+            },
+          },
+        });
+      } else {
+        yield* startTurn(runtime, providerThread, "default", [], "Hello again", undefined, 2);
+        yield* fake.takeRequest("prompt");
+        yield* fake.emit({ type: "agent_settled" });
+      }
+      const ended = yield* takeEvent(
+        (event) => event.type === "subagent.updated" && event.subagent.status !== "running",
+      );
+      assert.isTrue(
+        ended.type === "subagent.updated" &&
+          ended.subagent.id === (started.type === "subagent.updated" && started.subagent.id) &&
+          ended.subagent.status === (reported ? "failed" : "completed") &&
+          ended.subagent.result === (reported ? "no shell tool" : null) &&
+          ended.subagent.model === "anthropic/claude-haiku-5-5" &&
+          ended.subagent.completedAt !== null,
+      );
+      assert.isFalse(yield* runtime.hasPendingBackgroundWork!);
+    }).pipe(Effect.scoped, Effect.provide(layerTest)),
+  );
+
+  it.effect("shows a child the task tool waits for, with its progress and its reply", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakePi;
+      const { runtime, takeEvent } = yield* openRuntime(fake);
+      const providerThread = yield* runtime.ensureThread({
+        threadId: THREAD_ID,
+        modelSelection: modelSelection("default"),
+        runtimePolicy,
+      });
+      yield* startTurn(runtime, providerThread);
+      yield* fake.takeRequest("prompt");
+      yield* fake.emit({ type: "agent_start" });
+      const args = { subagent_type: "explore", prompt: "Find the entry point." };
+      yield* fake.emit({
+        type: "tool_execution_start",
+        toolCallId: "call_task",
+        toolName: "task",
+        args,
+      });
+      yield* fake.emit({
+        type: "tool_execution_update",
+        toolCallId: "call_task",
+        toolName: "task",
+        partialResult: {
+          content: [{ type: "text", text: "↳ last: reading src" }],
+          details: { task_id: "st_2", status: "running", lastAssistantLine: "reading src" },
+        },
+      });
+      const working = yield* takeEvent(
+        (event) => event.type === "subagent.updated" && event.subagent.progress !== undefined,
+      );
+      assert.isTrue(
+        working.type === "subagent.updated" &&
+          working.subagent.status === "running" &&
+          working.subagent.title === "explore" &&
+          working.subagent.progress === "reading src",
+      );
+      yield* fake.emit({
+        type: "tool_execution_end",
+        toolCallId: "call_task",
+        toolName: "task",
+        isError: false,
+        result: {
+          content: [{ type: "text", text: "src/main.ts" }],
+          details: { task_id: "st_2", status: "completed", run_in_background: false },
+        },
+      });
+      const done = yield* takeEvent(
+        (event) => event.type === "subagent.updated" && event.subagent.status === "completed",
+      );
+      assert.isTrue(done.type === "subagent.updated" && done.subagent.result === "src/main.ts");
+      assert.isFalse(yield* runtime.hasPendingBackgroundWork!);
+
+      // A `task` tool of another shape belongs to another extension.
+      yield* fake.emit({
+        type: "tool_execution_end",
+        toolCallId: "call_other",
+        toolName: "task",
+        args: { title: "write the changelog" },
+        isError: false,
+        result: { content: [{ type: "text", text: "noted" }] },
+      });
+      yield* fake.emit({ type: "agent_settled" });
+      let sawSubagent = false;
+      yield* takeEvent((event) => {
+        if (event.type === "subagent.updated") sawSubagent = true;
+        return event.type === "turn.terminal";
+      });
+      assert.isFalse(sawSubagent, "no subagent for a task tool that hosts no child");
+    }).pipe(Effect.scoped, Effect.provide(layerTest)),
+  );
+
   it.effect("persists edit patches and write content on file change items", () =>
     Effect.gen(function* () {
       const fake = yield* makeFakePi;
