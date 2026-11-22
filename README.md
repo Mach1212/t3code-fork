@@ -22,14 +22,6 @@ When nothing is left to carry, the release holds upstream's archive unchanged.
 
 - **Fixes that upstream has merged or replaced, until a stable release has them.** Their folders
   in `patches/` are named by the number of the pull request on upstream.
-- **OmO Native's subagents in the Pi provider** (`patches/omo-native-subagents`).
-  [OmO Native](https://omo.dev/docs) runs on senpi, a fork of Pi, so T3 Code's Pi provider can
-  drive it. Its `task` tool hosts child agents, and with this change they show as subagents: one
-  started in the background stays listed as running after its turn ended, until the session
-  reports its end. Upstream takes feature requests as
-  [Ideas discussions](https://github.com/pingdotgg/t3code/discussions/categories/ideas) and no
-  feature pull requests, so this one is this fork's own. It is on upstream's `main` as the
-  branch [`feat/pi-omo-native-subagents`](../../tree/feat/pi-omo-native-subagents).
 
 ## How it follows upstream
 
